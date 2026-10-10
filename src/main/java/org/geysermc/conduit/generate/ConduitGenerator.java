@@ -88,7 +88,8 @@ public final class ConduitGenerator {
         ClassNode shape = shapeOf(node, world);
 
         Map<String, List<Bindings.Bind>> binds = new LinkedHashMap<>();
-        for (Bindings.Bind bind : Bindings.of(shape, world)) {
+        List<Bindings.Bind> derived = ScopedValue.where(Effects.CLASSES, this::read).call(() -> Bindings.of(shape, world));
+        for (Bindings.Bind bind : derived) {
             binds.computeIfAbsent(bind.member(), member -> new ArrayList<>()).add(bind);
         }
 
@@ -456,17 +457,22 @@ public final class ConduitGenerator {
                     return null;
                 }
 
-                String name = this.declare(signature.substring(cursor[0] + 1, end).replace('/', '.'), imports, referenced);
+                String className = signature.substring(cursor[0] + 1, end).replace('/', '.');
+                String name = this.declare(className, imports, referenced);
                 cursor[0] = end;
                 if (signature.charAt(cursor[0]) != '<') {
                     cursor[0]++;
                     return name;
                 }
 
+                // Generated conduits are never generic, so only JDK types keep their type arguments.
+                boolean generic = className.startsWith("java.");
                 cursor[0]++;
                 List<String> arguments = new ArrayList<>();
                 while (cursor[0] < signature.length() && signature.charAt(cursor[0]) != '>') {
-                    String argument = this.fromSignature(signature, cursor, imports, referenced);
+                    String argument = generic
+                            ? this.fromSignature(signature, cursor, imports, referenced)
+                            : this.fromSignature(signature, cursor, new LinkedHashSet<>(), new LinkedHashSet<>());
                     if (argument == null) {
                         return null;
                     }
@@ -474,7 +480,7 @@ public final class ConduitGenerator {
                 }
 
                 cursor[0] += 2;
-                return name + "<" + String.join(", ", arguments) + ">";
+                return generic ? name + "<" + String.join(", ", arguments) + ">" : name;
             }
             default -> {
                 return null;

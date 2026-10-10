@@ -63,11 +63,10 @@ public final class ConduitWrapper {
                 return null;
             }
 
-            return Proxy.newProxyInstance(
-                    target.getClassLoader(),
-                    new Class<?>[]{target},
-                    new Handler(value, target, sourceLoader, calls)
-            );
+            Trace entry = registryEntry(value, sourceLoader);
+            return entry == null
+                    ? proxy(target, new Handler(value, target, sourceLoader, calls, null))
+                    : proxy(target, new Handler(entry.returned(), target, sourceLoader, entry.calls(), null));
         }
 
         if (Supplier.class.isAssignableFrom(target)) {
@@ -138,6 +137,51 @@ public final class ConduitWrapper {
             case "character", "char" -> (char) number.intValue();
             default -> number;
         };
+    }
+
+    public static Object withTypeArgument(Object conduit, String className) {
+        if (conduit == null || !Proxy.isProxyClass(conduit.getClass())
+                || !(Proxy.getInvocationHandler(conduit) instanceof Handler handler)) {
+            return conduit;
+        }
+
+        Handler specialized = new Handler(handler.value, handler.conduitType, handler.sourceLoader, handler.calls,
+                className.replace('.', '/'));
+        return proxy(handler.conduitType, specialized);
+    }
+
+    private static Object proxy(Class<?> conduitType, Handler handler) {
+        return Proxy.newProxyInstance(conduitType.getClassLoader(), new Class<?>[]{conduitType}, handler);
+    }
+
+    private static Trace registryEntry(Value value, ClassLoader loader) {
+        if (!(value instanceof Value.InstanceCall get) || !"get".equals(get.methodName()) || !get.args().isEmpty()) {
+            return null;
+        }
+
+        List<Value> registration = Handler.argsOf(get.receiver());
+        if (registration == null) {
+            return null;
+        }
+
+        Value.Lambda supplier = null;
+        for (Value argument : registration) {
+            if (argument instanceof Value.Lambda lambda && "get".equals(lambda.name())) {
+                if (supplier != null) {
+                    return null;
+                }
+
+                supplier = lambda;
+            }
+        }
+
+        Value supplied = supplier == null ? null : resolveSuppliedValue(supplier);
+        if (supplied == null) {
+            return null;
+        }
+
+        Trace trace = traceCall(supplied, loader);
+        return trace != null && trace.returned() != null ? trace : new Trace(supplied, List.of(), loader);
     }
 
     private static Class<?> inferSupplierType(java.lang.reflect.Type genericTarget) {
@@ -246,12 +290,15 @@ public final class ConduitWrapper {
         private final Class<?> conduitType;
         private final ClassLoader sourceLoader;
         private final List<Value.InstanceCall> calls;
+        private final String typeArgument;
 
-        Handler(Value value, Class<?> conduitType, ClassLoader sourceLoader, List<Value.InstanceCall> calls) {
+        Handler(Value value, Class<?> conduitType, ClassLoader sourceLoader, List<Value.InstanceCall> calls,
+                String typeArgument) {
             this.value = value;
             this.conduitType = conduitType;
             this.sourceLoader = sourceLoader;
             this.calls = calls;
+            this.typeArgument = typeArgument;
         }
 
         @Override
@@ -356,7 +403,7 @@ public final class ConduitWrapper {
                 return regrouped == null ? null : this.view(regrouped, method);
             }
 
-            Value member = resolveConduitMember(this.value, this.conduitType, name, this.sourceLoader, new HashSet<>());
+            Value member = resolveConduitMember(this.value, this.conduitType, name, this.sourceLoader, new HashSet<>(), this.typeArgument);
             if (member != null) {
                 return this.view(member, method);
             }
@@ -640,9 +687,11 @@ public final class ConduitWrapper {
                 }
             }
 
-            // A chain usually starts at a static factory. Treat it as a call so it can be matched too.
+            // A chain starts at a static factory or a constructor. Treat either as a call so it can be matched too.
             if (current instanceof Value.StaticCall root && root.methodName().equals(name)) {
                 matches.add(0, new Value.InstanceCall(root.className(), root.methodName(), current, root.args()));
+            } else if (current instanceof Value.Constructed root && "<init>".equals(name)) {
+                matches.add(0, new Value.InstanceCall(root.className(), name, current, root.args()));
             }
 
             return matches;
@@ -697,11 +746,12 @@ public final class ConduitWrapper {
             return null;
         }
 
-        private static Value resolveConduitMember(Value value, Class<?> conduitType, String member, ClassLoader loader, Set<String> seen) {
+        private static Value resolveConduitMember(Value value, Class<?> conduitType, String member, ClassLoader loader,
+                                                  Set<String> seen, String typeArgument) {
             Conduit conduit = conduitType.getAnnotation(Conduit.class);
             String internal = conduit == null ? null : conduit.value().replace('.', '/');
             List<String> members = memberCandidates(member);
-            return resolveMemberValue(value, internal, members, loader, seen);
+            return resolveMemberValue(value, internal, members, loader, seen, typeArgument);
         }
 
         private static Value resolveConduitMethod(Value value, Class<?> conduitType, String member, ClassLoader loader, Set<String> seen) {
@@ -783,7 +833,8 @@ public final class ConduitWrapper {
             return null;
         }
 
-        private static Value resolveMemberValue(Value value, String ownerInternal, List<String> members, ClassLoader loader, Set<String> seen) {
+        private static Value resolveMemberValue(Value value, String ownerInternal, List<String> members, ClassLoader loader,
+                                                Set<String> seen, String typeArgument) {
             if (loader == null) {
                 return null;
             }
@@ -802,7 +853,7 @@ public final class ConduitWrapper {
                 if (resolved instanceof Value.Constructed c) {
                     constructed = c;
                 } else if (resolved instanceof Value.InstanceCall || resolved instanceof Value.StaticCall) {
-                    return resolveMemberValue(resolved, ownerInternal, members, loader, seen);
+                    return resolveMemberValue(resolved, ownerInternal, members, loader, seen, typeArgument);
                 } else if (resolved instanceof Value.Field) {
                     return resolved;
                 } else {
@@ -816,7 +867,7 @@ public final class ConduitWrapper {
                 if (resolved instanceof Value.Constructed c) {
                     constructed = c;
                 } else if (resolved instanceof Value.InstanceCall || resolved instanceof Value.StaticCall) {
-                    return resolveMemberValue(resolved, ownerInternal, members, loader, seen);
+                    return resolveMemberValue(resolved, ownerInternal, members, loader, seen, typeArgument);
                 } else if (resolved instanceof Value.Field) {
                     return resolved;
                 } else {
@@ -854,7 +905,7 @@ public final class ConduitWrapper {
 
                     Value resolved = evaluateMethodReturn(node, method, fields, loader, seen);
                     if (resolved != null) {
-                        return dereference(loader, classCandidates, constructed.className(), resolved, seen, 0);
+                        return dereference(loader, classCandidates, constructed.className(), resolved, seen, 0, typeArgument);
                     }
 
                     return new Value.InstanceCall(className, member, constructed, new ArrayList<>());
@@ -1193,10 +1244,11 @@ public final class ConduitWrapper {
         /**
          * Resolves a value that only points at where the real one comes from. A field of another
          * class is followed to where the hierarchy assigns it, and a call on an unknown receiver
-         * is evaluated on the class named by the superclass's first type argument.
+         * is evaluated on the class named by the superclass's first type argument, or on
+         * {@code typeArgument} when that argument is only a type variable.
          */
         private static Value dereference(ClassLoader loader, List<String> candidates, String concrete,
-                                         Value value, Set<String> seen, int depth) {
+                                         Value value, Set<String> seen, int depth, String typeArgument) {
             if (value == null || depth > 4) {
                 return value;
             }
@@ -1204,7 +1256,7 @@ public final class ConduitWrapper {
             if (value instanceof Value.Multiple multiple) {
                 List<Value> mapped = new ArrayList<>();
                 for (Value each : multiple.values()) {
-                    Value one = dereference(loader, candidates, concrete, each, seen, depth + 1);
+                    Value one = dereference(loader, candidates, concrete, each, seen, depth + 1, typeArgument);
                     if (one != null && !mapped.contains(one)) {
                         mapped.add(one);
                     }
@@ -1219,16 +1271,20 @@ public final class ConduitWrapper {
             if (value instanceof Value.Field field && !candidates.contains(field.className())) {
                 Value stored = fieldAssignment(loader, candidates, field, seen);
                 if (stored != null && !stored.equals(value)) {
-                    return dereference(loader, candidates, concrete, stored, seen, depth + 1);
+                    return dereference(loader, candidates, concrete, stored, seen, depth + 1, typeArgument);
                 }
             }
 
             if (value instanceof Value.InstanceCall call && call.receiver() instanceof Value.Unknown) {
-                String entity = typeArgument(loader, concrete);
-                if (entity != null) {
-                    Value evaluated = evaluateOn(loader, entity, call.methodName(), seen);
+                String declared = typeArgument(loader, concrete);
+                if (declared == null) {
+                    declared = typeArgument;
+                }
+
+                if (declared != null) {
+                    Value evaluated = evaluateOn(loader, declared, call.methodName(), seen);
                     if (evaluated != null) {
-                        return dereference(loader, candidates, concrete, evaluated, seen, depth + 1);
+                        return dereference(loader, candidates, concrete, evaluated, seen, depth + 1, typeArgument);
                     }
                 }
             }

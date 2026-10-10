@@ -139,7 +139,8 @@ public @interface Conduit {
         /**
          * Matches calls in the fluent chain that produced the value, by method name. For a value
          * built as {@code Builder.create().size(4).name("a")}, {@code chain = "size"} matches the
-         * {@code size(4)} call. The static factory at the root of the chain can be matched too.
+         * {@code size(4)} call. The root of the chain can be matched too, by name for a static
+         * factory or as {@code "<init>"} for a constructor.
          *
          * @return the method name
          */

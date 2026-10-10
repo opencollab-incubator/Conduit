@@ -1,10 +1,12 @@
 package org.geysermc.conduit.generate;
 
+import org.objectweb.asm.Handle;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.TypeInsnNode;
@@ -18,8 +20,10 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 
 final class Effects {
+    static final ScopedValue<Function<String, ClassNode>> CLASSES = ScopedValue.newInstance();
 
     record Expr(Kind kind, int parameter, String field, String type, List<Expr> arguments) {
         static final Expr THIS = new Expr(Kind.THIS, -1, null, null, List.of());
@@ -41,12 +45,18 @@ final class Effects {
             return new Expr(Kind.FIELD, -1, name, null, List.of());
         }
 
+        static Expr lambda(Handle implementation, List<Expr> captures) {
+            return new Expr(Kind.LAMBDA, -1, implementation.getName() + implementation.getDesc(),
+                    implementation.getOwner(), captures);
+        }
+
         enum Kind {
             PARAMETER,
             FIELD,
             THIS,
             CONSTRUCTED,
             CALL,
+            LAMBDA,
             OTHER
         }
     }
@@ -55,7 +65,7 @@ final class Effects {
                    Map<String, Integer> assigns, Set<String> flags,
                    Map<String, List<Expr>> appends,
                    List<Construction> constructions, List<Construction> delegates, Construction forwards,
-                   int returnsParameter
+                   int returnsParameter, boolean isStatic
     ) {
     }
 
@@ -68,7 +78,8 @@ final class Effects {
     static List<Summary> of(ClassNode node) {
         List<Summary> summaries = new ArrayList<>();
         for (MethodNode method : node.methods) {
-            if ("<init>".equals(method.name)) {
+            // Synthetic methods, such as lambda bodies, are never called by name.
+            if ("<init>".equals(method.name) || (method.access & Opcodes.ACC_SYNTHETIC) != 0) {
                 continue;
             }
             summaries.add(summarise(node, method));
@@ -89,7 +100,7 @@ final class Effects {
 
     static Map<String, Expr> constructorFields(ClassNode node, MethodNode constructor) {
         Map<String, Expr> fields = new LinkedHashMap<>();
-        interpret(node, constructor, fields::put, null, null, passThroughOf(node));
+        interpret(node, constructor, fields::put, null, null, passThroughOf(node), null);
         return fields;
     }
 
@@ -130,8 +141,9 @@ final class Effects {
                     }
                 },
                 (field, arguments) -> appends.computeIfAbsent(field, key -> arguments),
-                new Sink(constructions, delegates, returnsThis, returnsField, statics, returnsParameter),
-                passThrough
+                new Sink(constructions, delegates, returnsThis, returnsField, statics, returnsParameter, new Expr[1]),
+                passThrough,
+                null
         );
 
         Construction forwards = returnsThis[0] || returnsField[0] != null || statics.isEmpty()
@@ -140,13 +152,14 @@ final class Effects {
 
         return new Summary(
                 method.name, method.desc, returnsThis[0], returnsField[0],
-                assigns, flags, appends, constructions, delegates, forwards, returnsParameter[0]
+                assigns, flags, appends, constructions, delegates, forwards, returnsParameter[0],
+                (method.access & Opcodes.ACC_STATIC) != 0
         );
     }
 
     private record Sink(List<Construction> constructions, List<Construction> delegates,
                         boolean[] returnsThis, String[] returnsField, List<Construction> statics,
-                        int[] returnsParameter
+                        int[] returnsParameter, Expr[] returned
     ) {
     }
 
@@ -159,7 +172,7 @@ final class Effects {
     }
 
     private static void interpret(ClassNode node, MethodNode method, Assignment assignment, Append append,
-                                  Sink sink, Map<String, Integer> passThrough) {
+                                  Sink sink, Map<String, Integer> passThrough, List<Expr> bound) {
         Deque<Expr> stack = new ArrayDeque<>();
         Type[] parameters = Type.getArgumentTypes(method.desc);
         Map<Integer, Expr> locals = new LinkedHashMap<>();
@@ -170,7 +183,7 @@ final class Effects {
 
         int slot = instance ? 1 : 0;
         for (int i = 0; i < parameters.length; i++) {
-            locals.put(slot, Expr.parameter(i));
+            locals.put(slot, bound != null && i < bound.size() ? bound.get(i) : Expr.parameter(i));
             slot += parameters[i].getSize();
         }
 
@@ -198,9 +211,25 @@ final class Effects {
                 case Opcodes.GETFIELD -> {
                     Expr receiver = pop(stack);
                     FieldInsnNode field = (FieldInsnNode) insn;
-                    stack.push(receiver.kind() == Expr.Kind.THIS && node.name.equals(field.owner)
-                            ? Expr.field(field.name)
-                            : Expr.OTHER);
+                    if (receiver.kind() == Expr.Kind.THIS && node.name.equals(field.owner)) {
+                        stack.push(Expr.field(field.name));
+                    } else if (receiver.kind() == Expr.Kind.CONSTRUCTED) {
+                        stack.push(constructedField(receiver, field.name));
+                    } else {
+                        stack.push(Expr.OTHER);
+                    }
+                }
+
+                case Opcodes.INVOKEDYNAMIC -> {
+                    InvokeDynamicInsnNode indy = (InvokeDynamicInsnNode) insn;
+                    List<Expr> captures = popAll(stack, Type.getArgumentTypes(indy.desc).length);
+                    if (Type.getReturnType(indy.desc).getSort() == Type.VOID) {
+                        break;
+                    }
+
+                    boolean lambda = "java/lang/invoke/LambdaMetafactory".equals(indy.bsm.getOwner())
+                            && indy.bsmArgs.length > 1 && indy.bsmArgs[1] instanceof Handle;
+                    stack.push(lambda ? Expr.lambda((Handle) indy.bsmArgs[1], captures) : Expr.OTHER);
                 }
 
                 case Opcodes.PUTFIELD -> {
@@ -245,6 +274,13 @@ final class Effects {
                         sink.delegates().add(new Construction(call.name, arguments));
                     }
 
+                    // An interning cache, map.computeIfAbsent(key, k -> new Value(k...)), hands back what the lambda builds.
+                    if ("computeIfAbsent".equals(call.name) && arguments.size() == 2
+                            && arguments.get(1).kind() == Expr.Kind.LAMBDA) {
+                        stack.push(apply(node, arguments.get(1), arguments.getFirst(), sink, passThrough));
+                        break;
+                    }
+
                     if (Type.getReturnType(call.desc).getSort() != Type.VOID) {
                         Integer handedBack = op == Opcodes.INVOKESTATIC && node.name.equals(call.owner)
                                 ? passThrough.get(call.name + call.desc)
@@ -269,6 +305,8 @@ final class Effects {
                         break;
                     }
 
+                    sink.returned()[0] = returned;
+
                     if (returned.kind() == Expr.Kind.THIS) {
                         sink.returnsThis()[0] = true;
                     }
@@ -289,6 +327,54 @@ final class Effects {
                 }
             }
         }
+    }
+
+    private static Expr apply(ClassNode node, Expr lambda, Expr argument, Sink sink, Map<String, Integer> passThrough) {
+        if (!node.name.equals(lambda.type())) {
+            return Expr.OTHER;
+        }
+
+        MethodNode implementation = null;
+        for (MethodNode method : node.methods) {
+            if (lambda.field().equals(method.name + method.desc)) {
+                implementation = method;
+            }
+        }
+
+        if (implementation == null) {
+            return Expr.OTHER;
+        }
+
+        List<Expr> arguments = new ArrayList<>(lambda.arguments());
+        arguments.add(argument);
+
+        Sink inner = new Sink(sink == null ? new ArrayList<>() : sink.constructions(), new ArrayList<>(),
+                new boolean[1], new String[1], new ArrayList<>(), new int[]{-1}, new Expr[1]);
+        interpret(node, implementation, (field, value) -> {
+        }, null, inner, passThrough, arguments);
+        return inner.returned()[0] == null ? Expr.OTHER : inner.returned()[0];
+    }
+
+    // Reading a field straight off new Value(a, b) gives back whichever argument its constructor stored there.
+    private static Expr constructedField(Expr constructed, String field) {
+        ClassNode type = CLASSES.isBound() ? CLASSES.get().apply(constructed.type()) : null;
+        if (type == null) {
+            return Expr.OTHER;
+        }
+
+        for (MethodNode constructor : type.methods) {
+            if (!"<init>".equals(constructor.name)
+                    || Type.getArgumentTypes(constructor.desc).length != constructed.arguments().size()) {
+                continue;
+            }
+
+            Expr assigned = constructorFields(type, constructor).get(field);
+            if (assigned != null && assigned.kind() == Expr.Kind.PARAMETER) {
+                return constructed.arguments().get(assigned.parameter());
+            }
+        }
+
+        return Expr.OTHER;
     }
 
     private static boolean passesThrough(String descriptor, List<Expr> arguments) {

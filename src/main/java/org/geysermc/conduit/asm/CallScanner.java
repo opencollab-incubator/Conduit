@@ -60,6 +60,7 @@ public final class CallScanner {
 
     private final Map<String, ClassNode> classCache = new HashMap<>();
     private final Map<String, Value> fieldCache = new HashMap<>();
+    private final Map<String, Map<String, Value>> initializing = new HashMap<>();
     private final Map<String, Boolean> reachesMatch = new HashMap<>();
     private final Set<String> resolving = new HashSet<>();
     private List<Value.InstanceCall> trace;
@@ -500,33 +501,29 @@ public final class CallScanner {
         if (cached != null) {
             return cached;
         }
-        if (this.resolving.contains(key)) {
-            return new Value.Field(owner, name);
+
+        Map<String, Value> initializing = this.initializing.get(owner);
+        if (initializing != null) {
+            Value assigned = initializing.get(name);
+            return assigned != null ? assigned : new Value.Field(owner, name);
         }
 
-        this.resolving.add(key);
-        try {
-            ClassNode cn = this.resolveClass(owner);
-            if (cn == null) {
-                return this.remember(key, new Value.Field(owner, name));
-            }
-
-            MethodNode clinit = findMethod(cn, "<clinit>", null);
-            if (clinit == null) {
-                return this.remember(key, new Value.Field(owner, name));
-            }
-
+        ClassNode cn = this.resolveClass(owner);
+        MethodNode clinit = cn == null ? null : findMethod(cn, "<clinit>", null);
+        if (clinit != null) {
             Map<String, Value> fields = new HashMap<>();
+            this.initializing.put(owner, fields);
             try {
                 this.interpret(clinit, fields);
-            } catch (Throwable t) {
-                return this.remember(key, new Value.Field(owner, name));
+            } catch (Throwable ignored) {
+            } finally {
+                this.initializing.remove(owner);
             }
-            Value v = fields.get(name);
-            return this.remember(key, v != null ? v : new Value.Field(owner, name));
-        } finally {
-            this.resolving.remove(key);
+
+            fields.forEach((field, value) -> this.fieldCache.putIfAbsent(owner + "." + field, value));
         }
+
+        return this.fieldCache.computeIfAbsent(key, ignored -> new Value.Field(owner, name));
     }
 
     Trace traceCall(String owner, String name, Value receiver, List<Value> args) {
@@ -632,11 +629,6 @@ public final class CallScanner {
             this.classCache.put(internalName, null);
             return null;
         }
-    }
-
-    private Value remember(String key, Value v) {
-        this.fieldCache.put(key, v);
-        return v;
     }
 
     private static MethodNode findMethod(ClassNode cn, String name, String desc) {

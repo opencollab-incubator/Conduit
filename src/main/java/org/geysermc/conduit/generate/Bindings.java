@@ -138,6 +138,12 @@ final class Bindings {
             binds.addAll(throughProducers(owner, field.name, assigned, world));
         }
 
+        for (Bind bind : throughStaticFactories(owner, Effects.of(owner), field.name, field.name, 1)) {
+            if (!binds.contains(bind)) {
+                binds.add(bind);
+            }
+        }
+
         binds.addAll(throughCalls(owner, field, world));
         return binds;
     }
@@ -336,6 +342,63 @@ final class Bindings {
             Bind bind = flag ? Bind.of(member) : Bind.of(member).arg(parameter).span(width);
             bind = bind.descriptor(summary.descriptor());
             binds.add(summary.returnsThis() ? bind.chain(summary.name()) : bind.calls(summary.name()));
+        }
+
+        binds.addAll(throughStaticFactories(producer, summaries, member, field, width));
+        return binds;
+    }
+
+    private static boolean setter(Effects.Summary summary) {
+        return summary.returnsThis() && !summary.isStatic()
+                && (!summary.assigns().isEmpty() || !summary.flags().isEmpty());
+    }
+
+    private static List<Bind> throughStaticFactories(ClassNode producer, List<Effects.Summary> summaries,
+                                                     String member, String field, int width) {
+        List<Bind> binds = new ArrayList<>();
+        if (summaries.stream().noneMatch(Bindings::setter)) {
+            return binds;
+        }
+
+        for (MethodNode constructor : producer.methods) {
+            if (!"<init>".equals(constructor.name)) {
+                continue;
+            }
+
+            Effects.Expr assigned = Effects.constructorFields(producer, constructor).get(field);
+            if (assigned == null || assigned.kind() != Effects.Expr.Kind.PARAMETER) {
+                continue;
+            }
+
+            Bind constructed = Bind.of(member).arg(assigned.parameter()).span(width)
+                    .descriptor(constructor.desc).chain("<init>");
+            if (!binds.contains(constructed)) {
+                binds.add(constructed);
+            }
+
+            int arity = Type.getArgumentTypes(constructor.desc).length;
+            for (Effects.Summary summary : summaries) {
+                if (!summary.isStatic()) {
+                    continue;
+                }
+
+                for (Effects.Construction construction : summary.constructions()) {
+                    if (!construction.type().equals(producer.name) || construction.arguments().size() != arity) {
+                        continue;
+                    }
+
+                    Span run = run(construction.arguments(), new Span(assigned.parameter(), width));
+                    if (run == null) {
+                        continue;
+                    }
+
+                    Bind bind = Bind.of(member).arg(run.from()).span(run.width())
+                            .descriptor(summary.descriptor()).chain(summary.name());
+                    if (!binds.contains(bind)) {
+                        binds.add(bind);
+                    }
+                }
+            }
         }
 
         return binds;
