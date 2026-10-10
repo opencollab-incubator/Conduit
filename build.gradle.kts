@@ -5,7 +5,7 @@ plugins {
 }
 
 allprojects {
-    group = "org.geysermc"
+    group = "dev.opencollab"
     version = "0.1.0-SNAPSHOT"
 
     repositories {

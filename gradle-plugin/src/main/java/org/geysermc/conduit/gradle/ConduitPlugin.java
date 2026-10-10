@@ -16,7 +16,7 @@ import org.gradle.jvm.toolchain.JavaToolchainService;
  *
  * <pre>{@code
  * plugins {
- *     id("org.geysermc.conduit")
+ *     id("dev.opencollab.conduit")
  * }
  *
  * conduit {
@@ -48,7 +48,7 @@ public class ConduitPlugin implements Plugin<Project> {
         conduit.getOutputDirectory().convention(project.getLayout().getBuildDirectory().dir("generated/conduit"));
         conduit.getContextJars().from(context);
 
-        Provider<String> dependency = conduit.getVersion().map(version -> "org.geysermc:conduit:" + version);
+        Provider<String> dependency = conduit.getVersion().map(version -> "dev.opencollab:conduit:" + version);
         project.getDependencies().addProvider(generator.getName(), dependency);
         project.getDependencies().addProvider(JavaPlugin.IMPLEMENTATION_CONFIGURATION_NAME, dependency);
 

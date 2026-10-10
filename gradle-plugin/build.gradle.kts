@@ -19,7 +19,7 @@ tasks.jar {
 gradlePlugin {
     plugins {
         create("conduit") {
-            id = "org.geysermc.conduit"
+            id = "dev.opencollab.conduit"
             implementationClass = "org.geysermc.conduit.gradle.ConduitPlugin"
             displayName = "Conduit"
             description = "Generates Conduit interfaces from the classes they mirror."

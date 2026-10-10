@@ -71,7 +71,7 @@ The Gradle plugin runs the generator as part of the build and adds Conduit to yo
 
 ```kotlin
 plugins {
-    id("org.geysermc.conduit") version "0.1.0-SNAPSHOT"
+    id("dev.opencollab.conduit") version "0.1.0-SNAPSHOT"
 }
 
 conduit {
@@ -97,7 +97,7 @@ repositories {
 }
 
 dependencies {
-    implementation("org.geysermc:conduit:0.1.0-SNAPSHOT")
+    implementation("dev.opencollab:conduit:0.1.0-SNAPSHOT")
 }
 ```
 

@@ -1,14 +1,13 @@
 package org.geysermc.conduit.generate;
 
 import org.geysermc.conduit.ConduitContext;
-import org.geysermc.conduit.asm.ConduitWrapper;
+import org.jetbrains.annotations.NotNull;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.MethodNode;
-import org.jetbrains.annotations.NotNull;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -42,7 +41,7 @@ import java.util.zip.CRC32;
  * they were generated, and leaves edited ones alone, so a binding the analysis can't derive can be
  * added by hand and survives the next run.
  *
- * <p>Also runnable from the command line, or through the {@code org.geysermc.conduit} Gradle plugin.
+ * <p>Also runnable from the command line, or through the {@code dev.opencollab.conduit} Gradle plugin.
  */
 public final class ConduitGenerator {
     private static final String STAMP = "// conduit:generated ";
