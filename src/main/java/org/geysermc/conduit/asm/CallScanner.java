@@ -1,5 +1,6 @@
 package org.geysermc.conduit.asm;
 
+import org.geysermc.conduit.Summary;
 import org.geysermc.conduit.Trace;
 import org.geysermc.conduit.Value;
 import org.objectweb.asm.ClassReader;
@@ -30,6 +31,7 @@ import java.util.Deque;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -53,6 +55,7 @@ public final class CallScanner {
     private static final int FOLLOW_DEPTH = 4;
     private static final int LOOP_DEPTH = 3;
     private static final int LOOP_LIMIT = 512;
+    private static final String PARAMETER = "arg";
 
     private final ConduitClassLoader loader;
     private final Predicate predicate;
@@ -63,6 +66,11 @@ public final class CallScanner {
     private final Map<String, Map<String, Value>> initializing = new HashMap<>();
     private final Map<String, Boolean> reachesMatch = new HashMap<>();
     private final Set<String> resolving = new HashSet<>();
+    private final Map<String, List<Value.Constructed>> constructions = new HashMap<>();
+    private final Map<String, Summary> forwarders = new HashMap<>();
+    private final Set<Forwarded> forwarded = new LinkedHashSet<>();
+    private boolean scanning;
+    private Opaque opaque = Opaque.NONE;
     private List<Value.InstanceCall> trace;
 
     public CallScanner(ConduitClassLoader loader, Predicate predicate, Sink sink) {
@@ -71,7 +79,12 @@ public final class CallScanner {
         this.sink = sink;
     }
 
+    public void opaque(Opaque opaque) {
+        this.opaque = opaque;
+    }
+
     public void scanAll() {
+        this.scanning = true;
         for (URL url : this.loader.getURLs()) {
             try {
                 File file = new File(url.toURI());
@@ -81,6 +94,104 @@ public final class CallScanner {
             } catch (Throwable ignored) {
             }
         }
+
+        this.scanning = false;
+        this.resolveForwarded();
+    }
+
+    private void emit(CallMatch match, List<Value> args) {
+        for (Value arg : args) {
+            if (arg instanceof Value.Unknown(String reason) && isParameter(reason)) {
+                return;
+            }
+        }
+        this.sink.accept(match);
+    }
+
+    private static boolean isParameter(String reason) {
+        return reason.length() > PARAMETER.length() && reason.startsWith(PARAMETER)
+                && reason.substring(PARAMETER.length()).chars().allMatch(Character::isDigit);
+    }
+
+    private record Forwarded(String owner, String name, String descriptor, List<Value> args) {
+    }
+
+    private void resolveForwarded() {
+        for (Forwarded call : this.forwarded) {
+            Summary summary = this.forwarders.get(call.owner() + "." + call.name() + call.descriptor());
+            for (Summary.Invocation invocation : summary.invocations()) {
+                if (!(invocation.call() instanceof Value.InstanceCall(String _, String _, Value.InstanceField(Value.This _, String _, String field), List<Value> args))) {
+                    continue;
+                }
+
+                for (Value.Constructed constructed : this.constructions.getOrDefault(call.owner(), List.of())) {
+                    Summary constructor = new Summarizer(this.loader, this.opaque).summarize(constructed.className(), "<init>", null, constructed.args());
+                    if (constructor != null && constructor.assigned(new Value.This(), field) instanceof Value.Lambda lambda) {
+                        this.invokeLambda(lambda, substitute(args, call.args()));
+                    }
+                }
+            }
+        }
+
+        this.forwarded.clear();
+    }
+
+    private void invokeLambda(Value.Lambda lambda, List<Value> args) {
+        if (lambda.implOwner() == null) {
+            return;
+        }
+
+        List<Value> all = new ArrayList<>(lambda.captures());
+        all.addAll(args);
+        if (this.predicate.matches(lambda.implOwner(), lambda.implMethod(), lambda.implDescriptor())) {
+            this.emit(new CallMatch(lambda.implOwner(), lambda.implMethod(), lambda.implDescriptor(), all), all);
+            return;
+        }
+
+        if (this.reachesMatch(lambda.implOwner(), lambda.implMethod(), lambda.implDescriptor(), FOLLOW_DEPTH)) {
+            Value receiver = !lambda.implStatic() && !all.isEmpty() ? all.removeFirst() : null;
+            this.evaluate(lambda.implOwner(), lambda.implMethod(), lambda.implDescriptor(), receiver, all);
+        }
+    }
+
+    private static List<Value> substitute(List<Value> values, List<Value> args) {
+        List<Value> out = new ArrayList<>(values.size());
+        for (Value value : values) {
+            out.add(value instanceof Value.Parameter(int index) && index < args.size() ? args.get(index) : value);
+        }
+        return out;
+    }
+
+    private boolean isForwarder(String owner, String name, String descriptor) {
+        String key = owner + "." + name + descriptor;
+        if (this.forwarders.containsKey(key)) {
+            return this.forwarders.get(key) != null;
+        }
+        this.forwarders.put(key, null);
+
+        ClassNode node = this.resolveClass(owner);
+        MethodNode method = node == null ? null : findMethod(node, name, descriptor);
+        if (method == null || !readsFieldAndCallsInterface(method)) {
+            return false;
+        }
+
+        Summary summary = new Summarizer(this.loader, this.opaque).summarize(owner, name, descriptor);
+        boolean forwards = summary != null && summary.invocations().stream().anyMatch(invocation ->
+                invocation.call() instanceof Value.InstanceCall(String _, String _, Value.InstanceField(Value.This _, String _, String _), List<Value> _));
+        this.forwarders.put(key, forwards ? summary : null);
+        return forwards;
+    }
+
+    private static boolean readsFieldAndCallsInterface(MethodNode method) {
+        boolean reads = false;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (insn.getOpcode() == Opcodes.GETFIELD) {
+                reads = true;
+            } else if (reads && insn.getOpcode() == Opcodes.INVOKEINTERFACE) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void scanJar(File jarFile) {
@@ -127,7 +238,7 @@ public final class CallScanner {
         Type[] argTypes = Type.getArgumentTypes(method.desc);
         for (int i = 0; i < argTypes.length; i++) {
             if (li < locals.length) {
-                locals[li] = new Value.Unknown("arg" + i);
+                locals[li] = new Value.Unknown(PARAMETER + i);
             }
             li += argTypes[i].getSize();
         }
@@ -350,17 +461,21 @@ public final class CallScanner {
                 if (m.name.equals("<init>")) {
                     if (!stack.isEmpty() && stack.peek() instanceof Value.Uninitialized u && u.className().equals(m.owner)) {
                         stack.pop();
-                        stack.push(new Value.Constructed(m.owner, args));
+                        Value.Constructed constructed = new Value.Constructed(m.owner, args);
+                        stack.push(constructed);
+                        if (args.stream().anyMatch(Value.Lambda.class::isInstance)) {
+                            this.constructions.computeIfAbsent(m.owner, _ -> new ArrayList<>()).add(constructed);
+                        }
                     }
                     if (this.predicate.matches(m.owner, m.name, m.desc)) {
-                        this.sink.accept(new CallMatch(m.owner, m.name, m.desc, args));
+                        this.emit(new CallMatch(m.owner, m.name, m.desc, args), args);
                     }
                 } else {
                     if (this.predicate.matches(m.owner, m.name, m.desc)) {
                         List<Value> all = new ArrayList<>();
                         all.add(thisRef);
                         all.addAll(args);
-                        this.sink.accept(new CallMatch(m.owner, m.name, m.desc, all));
+                        this.emit(new CallMatch(m.owner, m.name, m.desc, all), args);
                     }
                     if (Type.getReturnType(m.desc).getSort() != Type.VOID) {
                         stack.push(new Value.InstanceCall(m.owner, m.name, thisRef, args));
@@ -374,11 +489,11 @@ public final class CallScanner {
                 List<Value> args = popN(stack, mArgs.length);
                 boolean matched = this.predicate.matches(m.owner, m.name, m.desc);
                 if (matched) {
-                    this.sink.accept(new CallMatch(m.owner, m.name, m.desc, args));
+                    this.emit(new CallMatch(m.owner, m.name, m.desc, args), args);
                 }
 
                 if (Type.getReturnType(m.desc).getSort() != Type.VOID) {
-                    Value inlined = matched ? null : this.evaluate(m.owner, m.name, m.desc, null, args);
+                    Value inlined = matched || this.opaque.test(m.owner) ? null : this.evaluate(m.owner, m.name, m.desc, null, args);
                     stack.push(inlined != null ? inlined : new Value.StaticCall(m.owner, m.name, args));
                 } else if (!matched && this.reachesMatch(m.owner, m.name, m.desc, FOLLOW_DEPTH)) {
                     this.evaluate(m.owner, m.name, m.desc, null, args);
@@ -394,7 +509,9 @@ public final class CallScanner {
                     List<Value> all = new ArrayList<>();
                     all.add(receiver);
                     all.addAll(args);
-                    this.sink.accept(new CallMatch(m.owner, m.name, m.desc, all));
+                    this.emit(new CallMatch(m.owner, m.name, m.desc, all), args);
+                } else if (this.scanning && this.trace == null && this.isForwarder(m.owner, m.name, m.desc)) {
+                    this.forwarded.add(new Forwarded(m.owner, m.name, m.desc, args));
                 }
 
                 Value.InstanceCall call = new Value.InstanceCall(m.owner, m.name, receiver, args);
@@ -415,24 +532,7 @@ public final class CallScanner {
                     return;
                 }
                 if (Type.getReturnType(id.desc).getSort() != Type.VOID) {
-                    Value.Lambda lambda;
-                    if ("java/lang/invoke/LambdaMetafactory".equals(id.bsm.getOwner())
-                            && id.bsmArgs != null && id.bsmArgs.length >= 2
-                            && id.bsmArgs[1] instanceof Handle impl) {
-                        boolean implStatic = impl.getTag() == Opcodes.H_INVOKESTATIC;
-                        lambda = new Value.Lambda(
-                                id.name,
-                                id.desc,
-                                impl.getOwner(),
-                                impl.getName(),
-                                impl.getDesc(),
-                                implStatic,
-                                captures
-                        );
-                    } else {
-                        lambda = new Value.Lambda(id.name, id.desc, null, null, null, false, captures);
-                    }
-                    stack.push(lambda);
+                    stack.push(lambda(id, captures));
                 }
             }
 
@@ -496,6 +596,10 @@ public final class CallScanner {
     }
 
     Value staticField(String owner, String name) {
+        if (this.opaque.test(owner)) {
+            return new Value.Field(owner, name);
+        }
+
         String key = owner + "." + name;
         Value cached = this.fieldCache.get(key);
         if (cached != null) {
@@ -526,7 +630,7 @@ public final class CallScanner {
         return this.fieldCache.computeIfAbsent(key, ignored -> new Value.Field(owner, name));
     }
 
-    Trace traceCall(String owner, String name, Value receiver, List<Value> args) {
+    public Trace traceCall(String owner, String name, Value receiver, List<Value> args) {
         List<Value.InstanceCall> outer = this.trace;
         this.trace = new ArrayList<>();
         try {
@@ -697,47 +801,69 @@ public final class CallScanner {
         };
     }
 
-    // \u0001 marks an argument in the concat recipe, \u0002 a constant from the bootstrap.
-    static Value concat(InvokeDynamicInsnNode insn, List<Value> arguments) {
-        StringBuilder out = new StringBuilder();
-        String recipe = insn.bsmArgs != null && insn.bsmArgs.length > 0 && insn.bsmArgs[0] instanceof String text
-                ? text
-                : null;
-
-        if (recipe == null) {
-            for (Value argument : arguments) {
-                if (!(argument instanceof Value.Literal literal) || literal.value() == null) {
-                    return new Value.Unknown("concat");
-                }
-                out.append(literal.value());
-            }
-
-            return Value.literal(out.toString());
+    static Value.Lambda lambda(InvokeDynamicInsnNode id, List<Value> captures) {
+        if ("java/lang/invoke/LambdaMetafactory".equals(id.bsm.getOwner())
+                && id.bsmArgs != null && id.bsmArgs.length >= 2
+                && id.bsmArgs[1] instanceof Handle impl) {
+            return new Value.Lambda(id.name, id.desc, impl.getOwner(), impl.getName(), impl.getDesc(),
+                    impl.getTag() == Opcodes.H_INVOKESTATIC, captures);
         }
 
+        return new Value.Lambda(id.name, id.desc, null, null, null, false, captures);
+    }
+
+    // \u0001 marks an argument in the concat recipe, \u0002 a constant from the bootstrap.
+    static Value concat(InvokeDynamicInsnNode insn, List<Value> arguments) {
+        Value joined = concatenation(insn, arguments);
+        return joined instanceof Value.Literal ? joined : new Value.Unknown("concat");
+    }
+
+    // The joined string if every part is constant, otherwise the parts in order, constant runs merged.
+    static Value concatenation(InvokeDynamicInsnNode insn, List<Value> arguments) {
+        String recipe = insn.bsmArgs != null && insn.bsmArgs.length > 0 && insn.bsmArgs[0] instanceof String text
+                ? text
+                : "\u0001".repeat(arguments.size());
+
+        List<Value> parts = new ArrayList<>();
+        StringBuilder text = new StringBuilder();
         int argument = 0;
         int constant = 1;
         for (int i = 0; i < recipe.length(); i++) {
             char c = recipe.charAt(i);
+            Value part;
             if (c == '\u0001') {
-                if (argument >= arguments.size()
-                        || !(arguments.get(argument) instanceof Value.Literal literal)
-                        || literal.value() == null) {
+                if (argument >= arguments.size()) {
                     return new Value.Unknown("concat");
                 }
-                out.append(literal.value());
-                argument++;
+                part = arguments.get(argument++);
             } else if (c == '\u0002') {
                 if (insn.bsmArgs == null || constant >= insn.bsmArgs.length) {
                     return new Value.Unknown("concat");
                 }
-                out.append(insn.bsmArgs[constant++]);
+                part = Value.literal(String.valueOf(insn.bsmArgs[constant++]));
             } else {
-                out.append(c);
+                text.append(c);
+                continue;
+            }
+
+            if (part instanceof Value.Literal(Object literal) && literal != null) {
+                text.append(literal);
+            } else {
+                if (!text.isEmpty()) {
+                    parts.add(Value.literal(text.toString()));
+                    text.setLength(0);
+                }
+                parts.add(part);
             }
         }
 
-        return Value.literal(out.toString());
+        if (parts.isEmpty()) {
+            return Value.literal(text.toString());
+        }
+        if (!text.isEmpty()) {
+            parts.add(Value.literal(text.toString()));
+        }
+        return new Value.Operation(Value.Operator.CONCAT, List.copyOf(parts));
     }
 
     static Value safePop(Deque<Value> stack) {

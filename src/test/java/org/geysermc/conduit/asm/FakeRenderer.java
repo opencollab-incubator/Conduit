@@ -26,6 +26,17 @@ class FakeVariantRenderer extends FakeRenderer {
     }
 }
 
+class FakeMapRenderer extends FakeRenderer {
+    private static final java.util.Map<String, String> TEXTURES = java.util.Map.of(
+            "red", "mod:textures/entity/fox_red.png",
+            "snow", "mod:textures/entity/fox_snow.png");
+
+    @Override
+    public String getTextureLocation(Object renderState) {
+        return TEXTURES.get(renderState.toString());
+    }
+}
+
 class FakeRenderState {
     String texture;
 }

@@ -1,5 +1,7 @@
 package org.geysermc.conduit;
 
+import org.geysermc.conduit.fixture.Farm;
+import org.geysermc.conduit.fixture.AnimalEvent;
 import org.geysermc.conduit.fixture.Palette;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -11,6 +13,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Supplier;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 
@@ -40,19 +43,20 @@ class VirtualMachineTest {
         }
     }
 
+    @Intercept("org.geysermc.conduit.fixture.AnimalApi")
+    public static class AnimalApi {
+        @Intercept.Capture
+        public static CaptureChannel<String> CAPTURE;
+
+        public static void registerAnimal(String name, Supplier<String> sound) {
+            CAPTURE.emit(name + "=" + sound.get());
+        }
+    }
+
     @Test
     void interceptsEachRegistrationOnce(@TempDir Path directory) throws IOException {
-        Path jar = directory.resolve("palette.jar");
-        try (OutputStream out = Files.newOutputStream(jar); JarOutputStream jarOut = new JarOutputStream(out)) {
-            for (Class<?> fixture : List.of(Palette.class, org.geysermc.conduit.fixture.ColorRegistry.class,
-                    org.geysermc.conduit.fixture.Color.class)) {
-                String entry = fixture.getName().replace('.', '/') + ".class";
-                jarOut.putNextEntry(new JarEntry(entry));
-                try (InputStream in = fixture.getClassLoader().getResourceAsStream(entry)) {
-                    in.transferTo(jarOut);
-                }
-            }
-        }
+        Path jar = jar(directory.resolve("palette.jar"), Palette.class, org.geysermc.conduit.fixture.ColorRegistry.class,
+                org.geysermc.conduit.fixture.Color.class);
 
         List<String> registered = new ArrayList<>();
         VirtualMachine vm = VirtualMachineFactory.create(ConduitContext.load(jar)).await();
@@ -61,5 +65,33 @@ class VirtualMachineTest {
         vm.execute();
 
         assertEquals(List.of("sky=135,206,235", "grass=86,125,70"), registered);
+    }
+
+    @Test
+    void followsCallsForwardedThroughAFunctionHeldInAField(@TempDir Path directory) throws IOException {
+        Path jar = jar(directory.resolve("farm.jar"), org.geysermc.conduit.fixture.AnimalApi.class, AnimalEvent.class, Farm.class);
+
+        List<String> registered = new ArrayList<>();
+        VirtualMachine vm = VirtualMachineFactory.create(ConduitContext.load(jar)).await();
+        vm.intercept(AnimalApi.class);
+        vm.capture(AnimalApi.CAPTURE, registered::add);
+        vm.execute();
+
+        // Each call goes through both registrars: the lambda, and the method reference to the API itself.
+        assertEquals(List.of("cow=moo", "cow=moo",
+                "sheep=baa", "sheep=baa"), registered);
+    }
+
+    private static Path jar(Path jar, Class<?>... fixtures) throws IOException {
+        try (OutputStream out = Files.newOutputStream(jar); JarOutputStream jarOut = new JarOutputStream(out)) {
+            for (Class<?> fixture : fixtures) {
+                String entry = fixture.getName().replace('.', '/') + ".class";
+                jarOut.putNextEntry(new JarEntry(entry));
+                try (InputStream in = fixture.getClassLoader().getResourceAsStream(entry)) {
+                    in.transferTo(jarOut);
+                }
+            }
+        }
+        return jar;
     }
 }

@@ -18,14 +18,14 @@ import java.util.List;
 public record Trace(Value returned, List<Value.InstanceCall> calls, ClassLoader loader) {
 
     /**
-     * Views the returned value through a conduit.
+     * Views the returned value through a conduit, along with the calls recorded while producing it.
      *
      * @param conduit the conduit interface
      * @param <T> the conduit type
      * @return the conduit, or null if the value can't be viewed as one
      */
     public <T> T as(Class<T> conduit) {
-        Object coerced = ConduitWrapper.coerce(this.returned, conduit, this.loader);
+        Object coerced = ConduitWrapper.coerce(this.returned, conduit, conduit, this.loader, this.calls);
         return conduit.isInstance(coerced) ? conduit.cast(coerced) : null;
     }
 

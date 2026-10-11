@@ -2,6 +2,9 @@ package org.geysermc.conduit;
 
 import org.geysermc.conduit.asm.CallScanner;
 import org.geysermc.conduit.asm.ConduitWrapper;
+import org.geysermc.conduit.asm.Opaque;
+import org.geysermc.conduit.asm.Summarizer;
+import org.jetbrains.annotations.Nullable;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -32,6 +35,7 @@ public class VirtualMachine {
     private final ConduitContext context;
     private final Map<String, Class<?>> handlers = new HashMap<>();
     private final List<Runnable> captures = new ArrayList<>();
+    private Opaque opaque = Opaque.NONE;
 
     VirtualMachine(ConduitContext context) {
         this.context = context;
@@ -93,6 +97,67 @@ public class VirtualMachine {
             this.captures.forEach(Runnable::run);
             this.captures.clear();
         }
+    }
+
+    /**
+     * Stops summaries and traces from following code into some classes, keeping calls to them as
+     * calls. Useful when the context contains an API whose calls should be read, not its internals.
+     *
+     * @param names binary or internal class names, or package prefixes ending in a dot or slash
+     * @return this machine
+     */
+    public VirtualMachine opaque(String... names) {
+        this.opaque = Opaque.of(names);
+        return this;
+    }
+
+    /**
+     * Works out what a method does without running it: the fields it leaves assigned, the calls
+     * it makes, and what it returns, all in terms of its inputs. Calls on {@code this} and static
+     * calls into the context are followed; anything else is kept as a call.
+     *
+     * <pre>{@code
+     * Summary summary = vm.summarize("com.example.Dial", "turn", null);
+     * Value angle = summary.assigned(new Value.This(), "angle");
+     * }</pre>
+     *
+     * @param className the binary or internal name of the class to start the lookup from
+     * @param methodName the method, found on the class or inherited
+     * @param descriptor the method descriptor, or null for the first non-bridge method of that name
+     * @return the summary, or null if the method can't be found or is too large to follow
+     */
+    @Nullable
+    public Summary summarize(String className, String methodName, @Nullable String descriptor) {
+        return new Summarizer(this.context.classLoader(), this.opaque).summarize(className, methodName, descriptor);
+    }
+
+    /**
+     * Works out what the constructor call that built a value did, with the arguments it was given
+     * standing in for its parameters. The constructor is chosen by the number of arguments, or is the
+     * first one declared if none matches, as for a constructor reference that was never called.
+     *
+     * @param constructed the constructed value, such as one a handler received
+     * @return the summary, or null if the constructor can't be found or is too large to follow
+     */
+    @Nullable
+    public Summary summarize(Value.Constructed constructed) {
+        return new Summarizer(this.context.classLoader(), this.opaque)
+                .summarize(constructed.className(), "<init>", null, constructed.args());
+    }
+
+    /**
+     * Evaluates a call to a static method, recording every instance call made along the way.
+     *
+     * @param className the binary or internal name of the class declaring the method
+     * @param methodName the method
+     * @param args the arguments, chosen between overloads by count
+     * @return the trace, with a null value returned if the method couldn't be followed
+     */
+    public Trace trace(String className, String methodName, List<Value> args) {
+        CallScanner scanner = new CallScanner(this.context.classLoader(), (owner, name, descriptor) -> false, match -> {
+        });
+        scanner.opaque(this.opaque);
+        return scanner.traceCall(className.replace('.', '/'), methodName, null, args);
     }
 
     /**

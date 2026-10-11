@@ -40,6 +40,10 @@ public final class ConduitWrapper {
     private static final Map<Class<?>, Map<String, Integer>> METHOD_ORDER = new ConcurrentHashMap<>();
     private static final String THIS_MARKER = "__conduit_this__";
     private static final Object NOT_BOUND = new Object();
+    private static final Set<String> STRING_TYPES = Set.of("java/lang/String", "java/lang/Object", "java/lang/CharSequence");
+    private static final Set<String> NUMBER_TYPES = Set.of("java/lang/Object", "java/lang/Number", "java/lang/Integer", "java/lang/Long",
+            "java/lang/Float", "java/lang/Double", "java/lang/Short", "java/lang/Byte", "java/lang/Boolean", "java/lang/Character");
+    private static final Set<String> MAP_FACTORIES = Set.of("java/util/Map", "com/google/common/collect/ImmutableMap");
 
     private ConduitWrapper() {
     }
@@ -78,6 +82,10 @@ public final class ConduitWrapper {
                 }
 
                 Trace trace = traceCall(supplied, sourceLoader);
+                if (trace != null && trace.returned() == null) {
+                    // A call that can't be followed still says what was called.
+                    trace = new Trace(supplied, trace.calls(), sourceLoader);
+                }
                 if (suppliedType == Trace.class) {
                     return trace != null ? trace : new Trace(supplied, List.of(), sourceLoader);
                 }
@@ -92,7 +100,10 @@ public final class ConduitWrapper {
 
         if (List.class.isAssignableFrom(target)) {
             Class<?> element = inferSupplierType(genericTarget);
-            List<Value> values = value instanceof Value.Multiple multiple ? multiple.values() : List.of(value);
+            List<Value> values = new ArrayList<>();
+            for (Value each : value instanceof Value.Multiple multiple ? multiple.values() : List.of(value)) {
+                values.addAll(lookups(each));
+            }
 
             List<Object> coerced = new ArrayList<>(values.size());
             for (Value each : values) {
@@ -122,6 +133,25 @@ public final class ConduitWrapper {
         }
 
         return null;
+    }
+
+    // A lookup into a map built from constants can return any of its values.
+    private static List<Value> lookups(Value value) {
+        if (!(value instanceof Value.InstanceCall(String _, String name, Value map, List<Value> args))
+                || !(name.equals("get") || name.equals("getOrDefault"))
+                || !(map instanceof Value.StaticCall(String owner, String factory, List<Value> entries))
+                || !factory.equals("of") || !MAP_FACTORIES.contains(owner)) {
+            return List.of(value);
+        }
+
+        List<Value> values = new ArrayList<>();
+        for (int i = 1; i < entries.size(); i += 2) {
+            values.add(entries.get(i));
+        }
+        if (name.equals("getOrDefault") && args.size() == 2) {
+            values.add(args.get(1));
+        }
+        return values;
     }
 
     private static Object widen(Number number, Class<?> target) {
@@ -525,8 +555,7 @@ public final class ConduitWrapper {
                 if (own == null) {
                     return null;
                 }
-                if (!bind.descriptor().isEmpty()
-                        && Type.getArgumentTypes(bind.descriptor()).length != own.size()) {
+                if (!bind.descriptor().isEmpty() && !fits(own, bind.descriptor())) {
                     return null;
                 }
 
@@ -538,8 +567,14 @@ public final class ConduitWrapper {
             }
 
             if (!bind.descriptor().isEmpty()) {
-                int arity = Type.getArgumentTypes(bind.descriptor()).length;
-                matches = matches.stream().filter(call -> call.args().size() == arity).toList();
+                matches = matches.stream().filter(call -> fits(call.args(), bind.descriptor())).toList();
+            }
+
+            // A builder setter applies to what comes after it, so a single value takes the call nearest it in the chain.
+            Class<?> returned = method.getReturnType();
+            if (!bind.chain().isEmpty() && matches.size() > 1
+                    && !List.class.isAssignableFrom(returned) && !Map.class.isAssignableFrom(returned)) {
+                matches = List.of(matches.getLast());
             }
 
             List<List<Value>> arguments = new ArrayList<>(matches.size());
@@ -548,6 +583,28 @@ public final class ConduitWrapper {
             }
 
             return this.shape(method, arguments, bind, List.copyOf(matches));
+        }
+
+        // Overloads often share an argument count, so constants are checked against the parameter types too.
+        private static boolean fits(List<Value> arguments, String descriptor) {
+            Type[] parameters = Type.getArgumentTypes(descriptor);
+            if (parameters.length != arguments.size()) {
+                return false;
+            }
+
+            for (int i = 0; i < parameters.length; i++) {
+                if (!(arguments.get(i) instanceof Value.Literal(Object literal)) || literal == null) {
+                    continue;
+                }
+
+                boolean primitive = parameters[i].getSort() != Type.OBJECT && parameters[i].getSort() != Type.ARRAY;
+                String type = parameters[i].getInternalName();
+                if (literal instanceof String ? primitive || !STRING_TYPES.contains(type)
+                        : literal instanceof Number && !primitive && !NUMBER_TYPES.contains(type)) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         private Object shape(Method method, List<List<Value>> candidates, Conduit.Bind bind, List<Value> selves) {
@@ -665,12 +722,20 @@ public final class ConduitWrapper {
         private static List<Value.InstanceCall> callsOn(List<Value.InstanceCall> recorded, Value base, String name) {
             List<Value.InstanceCall> matches = new ArrayList<>();
             for (Value.InstanceCall call : recorded) {
-                if (call.methodName().equals(name) && call.receiver().equals(base)) {
+                if (call.methodName().equals(name) && (call.receiver().equals(base) || refetches(call.receiver(), base))) {
                     matches.add(call);
                 }
             }
 
             return matches;
+        }
+
+        private static boolean refetches(Value lookup, Value base) {
+            return lookup instanceof Value.InstanceCall(String _, String getter, Value parent, List<Value> keys)
+                    && keys.size() == 1 && keys.getFirst() instanceof Value.Literal
+                    && base instanceof Value.InstanceCall(String _, String putter, Value owner, List<Value> args)
+                    && !getter.equals(putter) && !args.isEmpty()
+                    && keys.getFirst().equals(args.getFirst()) && parent.equals(owner);
         }
 
         private List<Value.InstanceCall> chainedCalls(String name) {

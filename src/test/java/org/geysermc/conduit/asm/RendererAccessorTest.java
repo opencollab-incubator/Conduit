@@ -53,6 +53,12 @@ class RendererAccessorTest {
     }
 
     @Test
+    void everyValueOfAConstantMap() {
+        List<String> all = this.view("FakeMapRenderer", AllTextures.class).getTextureLocation();
+        assertEquals(List.of("mod:textures/entity/fox_red.png", "mod:textures/entity/fox_snow.png"), all);
+    }
+
+    @Test
     void undeclaredAccessorIsEmpty() {
         Object proxy = ConduitWrapper.coerce(new Value.Constructed("java/lang/Object", List.of()), NoTextures.class, this.loader);
         assertEquals(List.of(), ((NoTextures) proxy).getTextureLocation());

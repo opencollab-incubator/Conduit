@@ -151,6 +151,163 @@ public sealed interface Value {
     }
 
     /**
+     * The object a summarised method was called on.
+     */
+    record This() implements Value {
+
+        @Override
+        public String toString() {
+            return "this";
+        }
+    }
+
+    /**
+     * An argument of a summarised method, standing for whatever the caller passes.
+     *
+     * @param index the position among the declared parameters, from zero, not counting {@code this}
+     */
+    record Parameter(int index) implements Value {
+
+        @Override
+        public String toString() {
+            return "arg" + this.index;
+        }
+    }
+
+    /**
+     * A field read from an object, holding whatever the field contained when the method began.
+     *
+     * @param receiver the object the field is read from
+     * @param className the class the field was referenced through
+     * @param fieldName the field
+     */
+    record InstanceField(Value receiver, String className, String fieldName) implements Value {
+
+        @Override
+        public String toString() {
+            return this.receiver + "." + this.fieldName;
+        }
+    }
+
+    /**
+     * An operation over values that are not all constant. Comparisons and logical operators
+     * produce a boolean.
+     *
+     * @param operator the operator
+     * @param operands the operands, in source order
+     */
+    record Operation(Operator operator, List<Value> operands) implements Value {
+
+        @Override
+        public String toString() {
+            if (this.operator == Operator.INDEX) {
+                return this.operands.get(0) + "[" + this.operands.get(1) + "]";
+            }
+
+            if (this.operands.size() == 1) {
+                return this.operator.symbol + "(" + this.operands.getFirst() + ")";
+            }
+
+            StringBuilder sb = new StringBuilder("(");
+            for (int i = 0; i < this.operands.size(); i++) {
+                if (i > 0) {
+                    sb.append(' ').append(this.operator.symbol).append(' ');
+                }
+
+                sb.append(this.operands.get(i));
+            }
+
+            return sb.append(')').toString();
+        }
+    }
+
+    /**
+     * An operator of an {@link Operation}.
+     */
+    enum Operator {
+        ADD("+"),
+        SUBTRACT("-"),
+        MULTIPLY("*"),
+        DIVIDE("/"),
+        REMAINDER("%"),
+        NEGATE("-"),
+        AND("&"),
+        OR("|"),
+        XOR("^"),
+        SHIFT_LEFT("<<"),
+        SHIFT_RIGHT(">>"),
+        UNSIGNED_SHIFT_RIGHT(">>>"),
+        /** Converts a floating point number to an integer, rounding towards zero. */
+        TRUNCATE("(int)"),
+        /** A three-way comparison of two numbers: negative, zero or positive. */
+        COMPARE("<=>"),
+        EQUAL("=="),
+        NOT_EQUAL("!="),
+        LESS("<"),
+        LESS_OR_EQUAL("<="),
+        GREATER(">"),
+        GREATER_OR_EQUAL(">="),
+        LOGICAL_AND("&&"),
+        LOGICAL_OR("||"),
+        LOGICAL_NOT("!"),
+        /** The length of an array. */
+        LENGTH("length"),
+        /** An element of an array: the array, then the index. */
+        INDEX("[]"),
+        /** Strings joined in order, from concatenation with values that aren't constant. */
+        CONCAT("+");
+
+        private final String symbol;
+
+        Operator(String symbol) {
+            this.symbol = symbol;
+        }
+    }
+
+    /**
+     * A value that depends on a branch, as in {@code condition ? then : otherwise}.
+     *
+     * @param condition a boolean value
+     * @param then the value when the condition holds
+     * @param otherwise the value when it does not
+     */
+    record Conditional(Value condition, Value then, Value otherwise) implements Value {
+
+        @Override
+        public String toString() {
+            return "(" + this.condition + " ? " + this.then + " : " + this.otherwise + ")";
+        }
+    }
+
+    /**
+     * Whether a value is an instance of a class, as a boolean.
+     *
+     * @param value the value tested
+     * @param className the class tested against
+     */
+    record InstanceOf(Value value, String className) implements Value {
+
+        @Override
+        public String toString() {
+            return this.value + " instanceof " + shortName(this.className);
+        }
+    }
+
+    /**
+     * An array created with a constant length, and what was stored in it.
+     *
+     * @param componentType the descriptor of the element type
+     * @param elements the elements, defaulting to zero or null where nothing was stored
+     */
+    record Array(String componentType, List<Value> elements) implements Value {
+
+        @Override
+        public String toString() {
+            return "[" + join(this.elements) + "]";
+        }
+    }
+
+    /**
      * Anything the interpreter could not reconstruct.
      *
      * @param reason a short note on why, for debugging

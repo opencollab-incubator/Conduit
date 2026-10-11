@@ -65,6 +65,28 @@ new ConduitGenerator(ConduitContext.load(Path.of("api.jar")))
         .generateAll(Path.of("src/main/java/com/example/conduit"), "com.example.conduit", List.of("com.example.api.Color"));
 ```
 
+### Summaries
+
+Some code doesn't register data as much as it computes it. A summary works out what a method does in terms of its inputs, the fields it leaves assigned, the calls it makes and what it returns. 
+
+```java
+class Dial {
+    float angle;
+
+    void turn(float amount, boolean reverse) {
+        this.angle = reverse ? -amount : amount * 2;
+    }
+}
+```
+
+```java
+Summary summary = vm.summarize("com.example.Dial", "turn", null);
+Value angle = summary.assigned(new Value.This(), "angle");
+// ((arg1 != 0) ? -(arg0) : (arg0 * 2.0))
+```
+
+Calls on `this`, and static calls into the context, are followed. Anything else is kept as a call, so the result says which API was asked rather than how it answered.
+
 ## Gradle Plugin
 
 The Gradle plugin runs the generator as part of the build and adds Conduit to your dependencies.
